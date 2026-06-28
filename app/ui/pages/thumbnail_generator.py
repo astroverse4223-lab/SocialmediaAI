@@ -8,18 +8,21 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap, QFont, QImage
 
 from app.ui.components.cards import SectionHeader, Card
-from app.core.worker import GenerationWorker, ThumbnailWorker
+from app.core.worker import GenerationWorker
+from app.core.media_worker import ImageGenerationWorker
+from app.core.media_generator import IMAGE_PROVIDERS
 from app.core.ai_providers import create_provider
 import app.core.content_generator as cg
 
 
 class ThumbnailConceptCard(QFrame):
-    generate_image = Signal(str)
+    generate_image = Signal(str, int)   # prompt, card_index
 
     def __init__(self, number: int, parent=None):
         super().__init__(parent)
         self.setObjectName("card")
         self.number = number
+        self._card_index = number - 1
         self._setup()
 
     def _setup(self):
@@ -51,6 +54,12 @@ class ThumbnailConceptCard(QFrame):
         self.concept_text.setPlaceholderText("Concept details will appear here…")
         layout.addWidget(self.concept_text)
 
+        # Status label (shows errors/progress without overwriting concept text)
+        self.img_status_lbl = QLabel("")
+        self.img_status_lbl.setObjectName("caption")
+        self.img_status_lbl.setWordWrap(True)
+        layout.addWidget(self.img_status_lbl)
+
         # Image preview
         self.image_label = QLabel()
         self.image_label.setFixedSize(320, 180)
@@ -65,21 +74,37 @@ class ThumbnailConceptCard(QFrame):
 
     def set_concept(self, text: str):
         self.concept_text.setPlainText(text)
-        # Extract DALL-E prompt if present
-        if "DALL-E PROMPT" in text.upper() or "DALL-E 3" in text.upper():
-            lines = text.split("\n")
+        if not text.strip():
+            self._dalle_prompt = ""
+            self.gen_img_btn.setEnabled(False)
+            return
+
+        # Try to extract an explicit DALL-E / image prompt section first
+        prompt_lines = []
+        if "DALL-E" in text.upper() or "IMAGE PROMPT" in text.upper():
             in_prompt = False
-            prompt_lines = []
-            for line in lines:
-                if "DALL-E" in line.upper():
+            for line in text.split("\n"):
+                if "DALL-E" in line.upper() or "IMAGE PROMPT" in line.upper():
                     in_prompt = True
                     continue
                 if in_prompt and line.strip():
-                    prompt_lines.append(line)
-                    if len(prompt_lines) > 3:
+                    prompt_lines.append(line.strip())
+                    if len(prompt_lines) >= 4:
                         break
+
+        if prompt_lines:
             self._dalle_prompt = " ".join(prompt_lines)
-            self.gen_img_btn.setEnabled(bool(self._dalle_prompt))
+        else:
+            # No explicit prompt section — build one from the concept description
+            # Strip markdown markers and take the most descriptive lines
+            clean_lines = [
+                l.strip().lstrip("#*-•").strip()
+                for l in text.split("\n")
+                if l.strip() and not l.strip().startswith("**Concept")
+            ]
+            self._dalle_prompt = " ".join(clean_lines[:6])
+
+        self.gen_img_btn.setEnabled(bool(self._dalle_prompt))
 
     def set_image(self, img_bytes: bytes):
         pix = QPixmap()
@@ -95,7 +120,7 @@ class ThumbnailConceptCard(QFrame):
 
     def _on_gen_image(self):
         if self._dalle_prompt:
-            self.generate_image.emit(self._dalle_prompt)
+            self.generate_image.emit(self._dalle_prompt, self._card_index)
 
 
 class ThumbnailGeneratorPage(QWidget):
@@ -104,7 +129,8 @@ class ThumbnailGeneratorPage(QWidget):
         self.config = config
         self.db = db
         self._gen_worker = None
-        self._img_worker = None
+        # Per-card image workers so multiple cards can generate in parallel
+        self._img_workers: dict = {}
         self._concept_cards = []
         self.setObjectName("content_area")
         self._setup_ui()
@@ -140,9 +166,13 @@ class ThumbnailGeneratorPage(QWidget):
 
         bar_lay.addStretch()
 
-        note = QLabel("💡 Image generation requires OpenAI DALL-E 3")
-        note.setObjectName("caption")
-        bar_lay.addWidget(note)
+        bar_lay.addWidget(QLabel("Image Provider:"))
+        self.img_provider_combo = QComboBox()
+        self.img_provider_combo.setFixedHeight(38)
+        self.img_provider_combo.setMinimumWidth(220)
+        for p in IMAGE_PROVIDERS:
+            self.img_provider_combo.addItem(p["label"], p["key"])
+        bar_lay.addWidget(self.img_provider_combo)
         layout.addWidget(bar)
 
         # Scroll area with concept cards
@@ -209,21 +239,70 @@ class ThumbnailGeneratorPage(QWidget):
             else:
                 card.set_concept(content if i == 0 else "")
 
-    def _generate_image(self, dalle_prompt: str):
-        provider = create_provider(self.config)
-        if not hasattr(provider, "generate_image"):
+    def _generate_image(self, dalle_prompt: str, card_index: int):
+        # Allow each card to generate independently in parallel
+        existing = self._img_workers.get(card_index)
+        if existing and existing.isRunning():
             return
 
-        if self._img_worker and self._img_worker.isRunning():
+        provider_key = self.img_provider_combo.currentData()
+        provider = next((p for p in IMAGE_PROVIDERS if p["key"] == provider_key), None)
+        if not provider:
             return
 
-        self._img_worker = ThumbnailWorker(dalle_prompt, provider)
-        self._img_worker.image_ready.connect(self._on_image_ready)
-        self._img_worker.start()
+        api_key = self.config.get(provider["config_key"], "")
+        # DALL-E 3 shares the OpenAI key
+        if not api_key and provider_key == "dalle3":
+            api_key = self.config.get("openai_api_key", "")
 
-    def _on_image_ready(self, img_bytes: bytes):
-        # Save to thumbnails dir and show in first card that requested it
-        for card in self._concept_cards:
-            if card.gen_img_btn.isEnabled():
-                card.set_image(img_bytes)
-                break
+        card = self._concept_cards[card_index] if 0 <= card_index < len(self._concept_cards) else None
+        if not card:
+            return
+
+        if not api_key:
+            card.img_status_lbl.setText(
+                f"⚠️ No API key for {provider['label']}. Set it in AI Settings → Media API Keys."
+            )
+            return
+
+        card.img_status_lbl.setText("⏳ Generating image…")
+        card.gen_img_btn.setEnabled(False)
+        card.gen_img_btn.setText("⏳ Generating…")
+
+        worker = ImageGenerationWorker(
+            provider_key=provider_key,
+            prompt=dalle_prompt,
+            config=self.config,
+            size_key="Landscape 16:9  (1792×1024)",
+            n=1,
+        )
+        self._img_workers[card_index] = worker
+        worker.images_ready.connect(
+            lambda imgs, ci=card_index: self._on_image_ready(imgs, ci)
+        )
+        worker.error.connect(
+            lambda m, ci=card_index: self._on_image_error(m, ci)
+        )
+        worker.finished.connect(
+            lambda ci=card_index: self._on_image_done(ci)
+        )
+        worker.start()
+
+    def _on_image_error(self, msg: str, card_index: int):
+        card = self._concept_cards[card_index] if 0 <= card_index < len(self._concept_cards) else None
+        if card:
+            card.img_status_lbl.setText(f"❌ {msg}")
+
+    def _on_image_done(self, card_index: int):
+        card = self._concept_cards[card_index] if 0 <= card_index < len(self._concept_cards) else None
+        if card:
+            card.gen_img_btn.setEnabled(True)
+            card.gen_img_btn.setText("🎨 Generate Image")
+
+    def _on_image_ready(self, img_bytes_list: list, card_index: int):
+        if not img_bytes_list:
+            return
+        card = self._concept_cards[card_index] if 0 <= card_index < len(self._concept_cards) else None
+        if card:
+            card.set_image(img_bytes_list[0])
+            card.img_status_lbl.setText("✅ Image generated")

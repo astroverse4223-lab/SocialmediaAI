@@ -504,6 +504,8 @@ class VideoGeneratorTab(QWidget):
         self._submit_worker: Optional[VideoSubmitWorker] = None
         self._job_cards: Dict[str, VideoJobCard] = {}   # task_id → card
         self._active_jobs: List[Dict[str, Any]] = []     # live task_info list
+        self._poll_workers: List[Any] = []               # keep poll workers alive
+        self._dl_workers: List[Any] = []                 # keep download workers alive
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._poll_all_jobs)
         self._setup_ui()
@@ -730,7 +732,9 @@ class VideoGeneratorTab(QWidget):
             return
         for task_info in pending:
             worker = VideoPollWorker(task_info, self.config)
+            self._poll_workers.append(worker)
             worker.status_updated.connect(self._on_status_updated)
+            worker.finished.connect(lambda w=worker: self._poll_workers.remove(w) if w in self._poll_workers else None)
             worker.start()
 
     def _on_status_updated(self, updated: Dict[str, Any]):
@@ -766,8 +770,10 @@ class VideoGeneratorTab(QWidget):
             card.dl_btn.setText("⬇️ Downloading…")
 
         dl_worker = VideoDownloadWorker(url, path)
+        self._dl_workers.append(dl_worker)
         dl_worker.done.connect(lambda p: self._on_download_done(p, task_id))
         dl_worker.error.connect(lambda m: self.status_lbl.setText(f"❌ Download: {m}"))
+        dl_worker.finished.connect(lambda w=dl_worker: self._dl_workers.remove(w) if w in self._dl_workers else None)
         dl_worker.start()
 
     def _on_download_done(self, path: str, task_id: str):

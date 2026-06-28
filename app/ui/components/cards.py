@@ -46,7 +46,7 @@ class StatCard(QFrame):
 
         # Value
         self.value_lbl = QLabel(value)
-        self.value_lbl.setFont(QFont("Segoe UI Variable", 32, QFont.Weight.Bold))
+        self.value_lbl.setFont(QFont("Segoe UI", 32, QFont.Weight.Bold))
         self.value_lbl.setStyleSheet(f"color: {self._color};")
         layout.addWidget(self.value_lbl)
 

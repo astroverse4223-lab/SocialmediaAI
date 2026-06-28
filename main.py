@@ -35,7 +35,7 @@ def _create_splash() -> QSplashScreen:
     p.drawText(0, 80, 640, 70, Qt.AlignmentFlag.AlignCenter, "🎬")
 
     # Title
-    p.setFont(QFont("Segoe UI Variable", 34, QFont.Weight.Bold))
+    p.setFont(QFont("Segoe UI", 34, QFont.Weight.Bold))
     p.drawText(0, 150, 640, 60, Qt.AlignmentFlag.AlignCenter, "AI YouTube Studio")
 
     # Tagline
@@ -61,9 +61,7 @@ def main():
     app.setOrganizationName("AI Studio")
 
     # Set default font
-    font = QFont("Segoe UI Variable", 10)
-    if not font.exactMatch():
-        font = QFont("Segoe UI", 10)
+    font = QFont("Segoe UI", 10)
     font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     app.setFont(font)
 
